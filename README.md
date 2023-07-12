@@ -12,7 +12,7 @@ There are two main reasons for determining these mappings:
 
 In all systems studied to date, the hash consists of a relatively short (16 to 16384 elements) “base sequence” of slice numbers, which is repeated with binary permutations for consecutive blocks of memory. The specific binary permutation used is selected by XOR-reductions of different subsets of the higher-order address bits. A [technical report with data files](http://dx.doi.org/10.26153/tsw/14539) provides the base sequences and permutation select masks for Intel Xeon Scalable Processors (1st and 2nd generation) with 14, 16, 18, 20, 22, 24, 26, 28 slices, for 3rd Generation Intel Xeon Scalable Processors with 28 slices, and for Xeon Phi x200 processors with 38 slices.
 
-The "SnoopFilterMapper.c" codes use a fairly simple approach to determining the mapping of addresses to L3 slices:
+The "Map_Addresses_to_L3-Slices.c" code(s) here use a fairly simple approach to determining the mapping of addresses to L3 slices:
 - Bind the process to a single core.
 - Allocate a large region on a 2MiB boundary with transparent hugepages enabled.  Default is 2GiB.
 - For each 2MiB-aligned region:
