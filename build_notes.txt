@@ -1,0 +1,33 @@
+
+
+
+
+
+
+
+Original build instructions as captured by the icc "-sox" flag:
+staff.frontera:~/Frontera/Util/ICX_mapper:2023-07-12T18:30:58 $ strings SnoopFilterMapper.exe | grep sox
+-?comment:Intel(R) C Intel(R) 64 Compiler for applications running on Intel(R) 64, Version 19.1.1.217 Build 20200306  : SnoopFilterMapper.c : -sox -g -O0 -DMAP_L3 -DMYHUGEPAGE_THP -DCHA_COUNTS -o SnoopFilterMapper.exe 
+-?comment:Intel(R) C Intel(R) 64 Compiler for applications running on Intel(R) 64, Version 19.1.1.217 Build 20200306  : va2pa_lib.c : -sox -g -O0 -DMAP_L3 -DMYHUGEPAGE_THP -DCHA_COUNTS -o SnoopFilterMapper.exe 
+-?comment:Intel(R) C Intel(R) 64 Compiler for applications running on Intel(R) 64, Version 19.1.1.217 Build 20200306  : ssum.c : -sox -g -O0 -DMAP_L3 -DMYHUGEPAGE_THP -DCHA_COUNTS -o SnoopFilterMapper.exe 
+-sox -g -O0 -DMAP_L3 -DMYHUGEPAGE_THP -DCHA_COUNTS -o SnoopFilterMapper.exe
+
+
+The updated version ("Map_Addresses_to_L3_Slices_ICX.c") can be built in a single step.  (va2pa_lib.c is #included and ssum.c is not called before exit)
+
+With the Intel icc compiler, I used
+	icc -sox -g -O0 -DMAP_L3 -DMYHUGEPAGE_THP -DCHA_COUNTS  Map_Addresses_to_L3_Slices_ICX.c -o Map_Addresses_to_L3_Slices_ICX.exe
+
+The resulting code ran correctly on a 40-core ICX (Xeon Platinum 8380).
+
+To Do:
+	1. Reduce NUMPAGES from 40960 (80 GiB) to something more reasonable -- 1024 is probably fine to start.
+	2. There is tons of code from other tests in here -- not needed but does not seem to break anything.
+		Should be cleaned out at some point.
+	3. Eventually I need to merge the SKX, ICX, and SPR versions of this code into a single source file.
+		The CHA counter addressing is different and the SPR has different EventSelect values for the CHA 
+		events, but the changes can be isolated to few sections.
+
+Already Done:
+	1. Remove all the code below the MAP_L3 section -- it is not used in the Address to L3-Slice mapping.
+		Not tested in execution, but compiles OK.
