@@ -4,7 +4,7 @@
 - Created 2021-09-09, Revised to 2023-07-14
 
 ## Background information
-Nothing in this directory will make sense unless you are familiar with the material presented in the [technical report](https://github.com/jdmccalpin/Intel_Address_Hash/edit/main/Results/README.md#reference-and-citation) linked below.
+Nothing in this directory will make sense unless you are familiar with the material presented in the [technical report](README.md#reference-and-citation) linked below.
 
 ## File format information for Intel_Address_Hash/Results/ files
 
