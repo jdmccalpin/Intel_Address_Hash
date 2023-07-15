@@ -26,8 +26,8 @@ static char const rcsid[] = "$Id: SnoopFilterMapper.c,v 1.3 2023/01/12 17:53:11 
 #define PAGES_MAPPED 2L			// this is still specifying how many 2MiB pages to map
 #else
 #define MYPAGESIZE 2097152L
-#define NUMPAGES 40960L
-#define PAGES_MAPPED 256L
+#define NUMPAGES 2048L			// 40960L (80 GiB) for big production runs
+#define PAGES_MAPPED 16L		// 128L or 256L for production runs
 #endif // MYHUGEPAGE_1GB
 
 
