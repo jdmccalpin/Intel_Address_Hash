@@ -17,18 +17,9 @@ static char const rcsid[] = "$Id: SnoopFilterMapper.c,v 1.3 2023/01/12 17:53:11 
 #include <time.h>
 #include <sys/time.h>			// for gettimeofday
 
-# define ARRAYSIZE 2147483648L
-
-// MYHUGEPAGE_1GB overrides default of 2MiB for hugepages
-#if defined MYHUGEPAGE_1GB
-#define MYPAGESIZE 1073741824UL
-#define NUMPAGES 2L
-#define PAGES_MAPPED 2L			// this is still specifying how many 2MiB pages to map
-#else
 #define MYPAGESIZE 2097152L
 #define NUMPAGES 2048L			// 40960L (80 GiB) for big production runs
 #define PAGES_MAPPED 16L		// 128L or 256L for production runs
-#endif // MYHUGEPAGE_1GB
 
 
 #define SPECIAL_VALUE (-1)
@@ -65,7 +56,6 @@ long lines_by_cha[NUM_CHA_USED];			// bulk count of lines assigned to each CHA
 #include "MSR_defs.h"                   // includes MSR_Architectural.h and MSR_ArchPerfMon_v3.h -- very few of these defines are used here 
 #include "low_overhead_timers.c"        // probably need to link this to my official github version
 #include "cpuid_check_inline.c"         // CPUID "signatures" (CPUID/leaf 0x01, return value in eax with stepping masked out)
-#include "PCI_cfg_index.c"              // convert bus/device/function/offset to index on uint32_t mmapped array
 
 // ===========================================================================================================================================================================
 int main(int argc, char *argv[])
@@ -77,12 +67,8 @@ int main(int argc, char *argv[])
 	int rc;
 	ssize_t rc64;
 	size_t len;
-	long arraylen;
-	long l2_contained_size, inner_repetitions;
 	unsigned long pagemapentry;
 	unsigned long paddr, basephysaddr;
-	unsigned long pagenum, basepagenum;
-	uint32_t bus, device, function, offset, ctl_offset, ctr_offset, value, index;
 	uint32_t socket, counter;
 	long count,delta;
 	long j,k,page_number,page_base_index,line_number;
@@ -96,37 +82,25 @@ int main(int argc, char *argv[])
 	int proc_in_pkg[2];			// one Logical Processor number for each socket
 	uid_t my_uid;
 	gid_t my_gid;
-	double sum,expected;
-	double t0, t1;
-	double avg_cycles;
-	unsigned long tsc_start, tsc_end;
-	double tsc_rate = 2.1e9;
-	double sf_evict_rate;
-	double bandwidth;
+	double sum;
+	unsigned long tsc_start;
+
+    uint32_t CurrentCPUIDSignature;     // CPUID Signature for the current system -- save for later processor-dependent conditionals
 
     // ===============================================================================================================================
 	// allocate working array on a huge pages -- either 1GiB or 2MiB
-	len = NUMPAGES * MYPAGESIZE;
-#if defined MYHUGEPAGE_1GB
-	array = (double*) mmap(NULL, len, PROT_READ | PROT_WRITE, MAP_ANONYMOUS | MAP_PRIVATE | MAP_HUGETLB | MAP_HUGE_1GB, -1, 0 );
-#elif defined MYHUGEPAGE_THP
-	//array = (double*) mmap(NULL, len, PROT_READ | PROT_WRITE, MAP_ANONYMOUS | MAP_PRIVATE, -1, 0 );
+	len = NUMPAGES * MYPAGESIZE;        // Bytes
 	rc = posix_memalign((void **)&array, (size_t) 2097152, (size_t) len);
 	if (rc != 0) {
 		printf("ERROR: posix_memalign call failed with error code %d\n",rc);
 		exit(3);
 	}
-#else
-	array = (double*) mmap(NULL, len, PROT_READ | PROT_WRITE, MAP_ANONYMOUS | MAP_PRIVATE | MAP_HUGETLB, -1, 0 );
-#endif // MYHUGEPAGE_1GB
 	if (array == (void *)(-1)) {
         perror("ERROR: mmap of array a failed! ");
         exit(1);
     }
 	// initialize working array
-	arraylen = NUMPAGES * MYPAGESIZE/sizeof(double);
-// #pragma omp parallel for
-	for (j=0; j<arraylen; j++) {
+	for (j=0; j<len/sizeof(double); j++) {
 		array[j] = 1.0;
 	}
 	// initialize page_pointers to point to the beginning of each page in the array
@@ -179,8 +153,6 @@ int main(int argc, char *argv[])
 	//========================================================================================================================
 	// Identify the processor by CPUID signature (CPUID leaf 0x01, return value in %eax)
 	// If not supported, Don't abort yet but save the CurrentCPUIDSignature for later processor-dependent conditionals
-
-    uint32_t CurrentCPUIDSignature;     // CPUID Signature for the current system -- save for later processor-dependent conditionals
     CurrentCPUIDSignature = cpuid_signature();
 
     switch(CurrentCPUIDSignature) {
@@ -205,7 +177,7 @@ int main(int argc, char *argv[])
 	nr_cpus = sysconf(_SC_NPROCESSORS_ONLN);
     proc_in_pkg[0] = 0;                 // logical processor 0 is in socket 0 in all TACC systems
     proc_in_pkg[1] = nr_cpus-1;         // logical processor N-1 is in socket 1 in all TACC 2-socket systems
-	for (pkg=0; pkg<2; pkg++) {
+	for (pkg=0; pkg<NUM_SOCKETS; pkg++) {
 		sprintf(filename,"/dev/cpu/%d/msr",proc_in_pkg[pkg]);
 		msr_fd[pkg] = open(filename, O_RDWR);
 		if (msr_fd[pkg] == -1) {
@@ -213,145 +185,13 @@ int main(int argc, char *argv[])
 			exit(-1);
 		}
 	}
-	for (pkg=0; pkg<2; pkg++) {
+	for (pkg=0; pkg<NUM_SOCKETS; pkg++) {
 		pread(msr_fd[pkg],&msr_val,sizeof(msr_val),IA32_TIME_STAMP_COUNTER);
 		fprintf(stdout,"DEBUG: TSC on core %d socket %d is %ld\n",proc_in_pkg[pkg],pkg,msr_val);
 	}
 
     int core_under_test, socket_under_test;
     tsc_start = full_rdtscp(&socket_under_test, &core_under_test);
-
-	// Program the CHA mesh counters
-	//
-	// Updated for ICX -- several uglies here....
-	//   Each CHA has a block of 14 MSRs reserved, of which 11 are used
-	//   The base for the first 18 CHAs (0-17) is 0xE00 + 0x0E*CHA
-	//          for CHAs 18-33 add 0x0E to the computed value
-	//          for CHAs 23-39 subtract 1148 from the computed value
-	//   Within each block:
-	//   	Unit Control is at offset 0x00
-	//   	CTL0, 1, 2, 3 are at offsets 0x01, 0x02, 0x03, 0x04
-	//   	CTR0, 1, 2, 3 are at offsets 0x08, 0x09, 0x0a, 0x0b
-	//
-	//   For the moment I think I can ignore the filter registers at offsets 0x05 and 0x06
-	//     and the status register at offset 0x07
-	//  For ICX one of the filter registers was dropped and the remaining filter register is 
-	//     interpreted differently depending on the event being measured.
-	//  ICX uses high-order bits in the perfevtsel registers, so these must be 64-bit variables.
-	//
-	//   The control register needs bit 22 set to enabled, then bits 15:8 as Umask and 7:0 as EventSelect
-	//   Mesh Events:
-	//   	HORZ_RING_BL_IN_USE = 0xab
-	//   		LEFT_EVEN = 0x01
-	//   		LEFT_ODD = 0x02
-	//   		RIGHT_EVEN = 0x04
-	//   		RIGHT_ODD = 0x08
-	//   	VERT_RING_BL_IN_USE = 0xaa
-	//   		UP_EVEN = 0x01
-	//   		UP_ODD = 0x02
-	//   		DN_EVEN = 0x04
-	//   		DN_ODD = 0x08
-	//   For starters, I will combine even and odd and create 4 events
-	//   	0x004003ab	HORZ_RING_BL_IN_USE.LEFT
-	//   	0x00400cab	HORZ_RING_BL_IN_USE.RIGHT
-	//   	0x004003aa	VERT_RING_BL_IN_USE.UP
-	//   	0x00400caa	VERT_RING_BL_IN_USE.DN
-
-	// first set to try....
-//	cha_perfevtsel[0] = 0x004003ab;		// HORZ_RING_BL_IN_USE.LEFT
-//	cha_perfevtsel[1] = 0x00400cab;		// HORZ_RING_BL_IN_USE.RIGHT
-//	cha_perfevtsel[2] = 0x004003aa;		// VERT_RING_BL_IN_USE.UP
-//	cha_perfevtsel[3] = 0x00400caa;		// VERT_RING_BL_IN_USE.DN
-
-	// second set to try....
-//	cha_perfevtsel[0] = 0x004001ab;		// HORZ_RING_BL_IN_USE.LEFT_EVEN
-//	cha_perfevtsel[1] = 0x004002ab;		// HORZ_RING_BL_IN_USE.LEFT_ODD
-//	cha_perfevtsel[2] = 0x004004ab;		// HORZ_RING_BL_IN_USE.RIGHT_EVEN
-//	cha_perfevtsel[3] = 0x004008ab;		// HORZ_RING_BL_IN_USE.RIGHT_ODD
-//
-// ==================================================================================================================
-// https://download.01.org/perfmon/ICX/icelakex_uncore_v1.06.json
-// {
-//    "Unit": "CHA",
-//    "EventCode": "0x34",
-//    "UMask": "0xFF",
-//    "PortMask": "0x00",
-//    "FCMask": "0x00",
-//    "UMaskExt": "0x1BC1",
-//    "EventName": "UNC_CHA_LLC_LOOKUP.DATA_READ",
-//    "BriefDescription": "Cache and Snoop Filter Lookups; Data Read Request",
-//    "PublicDescription": "Counts the number of times the LLC was accessed - this includes code, data, prefetches and hints coming from L2.  This has numerous filters available.  Note the non-standard filtering equation.  This event will count requests that lookup the cache multiple times with multiple increments.  One must ALWAYS set umask bit 0 and select a state or states to match.  Otherwise, the event will count nothing.   CHAFilter0[24:21,17] bits correspond to [FMESI] state. Read transactions",
-//    "Counter": "0,1,2,3",
-//    "MSRValue": "0x00",
-//    "ELLC": "0",
-//    "Filter": "na",
-//    "ExtSel": "0",
-//    "Deprecated": "0",
-//    "FILTER_VALUE": "0",
-//    "CounterType": "PGMABLE"
-//  },
-// ------------------------------------------------------------------------------------------------------------------
-// https://download.01.org/perfmon/ICX/icelakex_uncore_v1.06_experimental.json
-// Lists many versions of this event without the high-order bits
-//   0x00400134 UNC_CHA_LLC_LOOKUP.I        LLC misses
-//   0x00400234 UNC_CHA_LLC_LOOKUP.SF_S     SF hit S
-//   0x00400434 UNC_CHA_LLC_LOOKUP.SF_E     SF hit E
-//   0x00400834 UNC_CHA_LLC_LOOKUP.SF_H     SF hit H (HitMe state)
-//   0x00401034 UNC_CHA_LLC_LOOKUP.S        LLC HitS
-//   0x00402034 UNC_CHA_LLC_LOOKUP.E        LLC HitE
-//   0x00404034 UNC_CHA_LLC_LOOKUP.M        LLC HitM
-//   0x00408034 UNC_CHA_LLC_LOOKUP.F        LLC HitF
-// And many more with the high-order bits
-//   0x0000 1bc8 0040 ff34 UNC_CHA_LLC_LOOKUP.RFO
-//   0x0000 1fff 0040 ff34 UNC_CHA_LLC_LOOKUP.ALL
-//   0x0000 1bc1 0040 ff34 UNC_CHA_LLC_LOOKUP.DATA_READ
-//   0x0000 1a44 0040 ff34 UNC_CHA_LLC_LOOKUP.FLUSH_INV
-//   0x0000 1bd0 0040 ff34 UNC_CHA_LLC_LOOKUP.CODE_READ
-//   0x0000 0bdf 0040 ff34 UNC_CHA_LLC_LOOKUP.LOC_HOM
-//   0x0000 15df 0040 ff34 UNC_CHA_LLC_LOOKUP.REM_HOM
-//   0x0000 1a04 0040 ff34 UNC_CHA_LLC_LOOKUP.FLUSH_INV_REMOTE
-//   0x0000 1a01 0040 ff34 UNC_CHA_LLC_LOOKUP.DATA_READ_REMOTE
-//   0x0000 1a08 0040 ff34 UNC_CHA_LLC_LOOKUP.RFO_REMOTE
-//   0x0000 1a10 0040 ff34 UNC_CHA_LLC_LOOKUP.CODE_READ_REMOTE
-//   0x0000 1c19 0040 ff34 UNC_CHA_LLC_LOOKUP.REMOTE_SNP
-//   0x0000 1844 0040 ff34 UNC_CHA_LLC_LOOKUP.FLUSH_INV_LOCAL
-//   0x0000 19c1 0040 ff34 UNC_CHA_LLC_LOOKUP.DATA_READ_LOCAL
-//   0x0000 19c8 0040 ff34 UNC_CHA_LLC_LOOKUP.RFO_LOCAL
-//   0x0000 19d0 0040 ff34 UNC_CHA_LLC_LOOKUP.CODE_READ_LOCAL
-//   0x0000 189d 0040 ff34 UNC_CHA_LLC_LOOKUP.LLCPREF_LOCAL
-//   0x0000 0008 0040 **34 UNC_CHA_LLC_LOOKUP.RFO_F
-//   0x0000 0800 0040 **34 UNC_CHA_LLC_LOOKUP.LOCAL_F
-//   0x0000 1000 0040 **34 UNC_CHA_LLC_LOOKUP.REMOTE_F
-//   0x0000 0400 0040 **34 UNC_CHA_LLC_LOOKUP.REMOTE_SNOOP_F
-//   0x0000 0020 0040 **34 UNC_CHA_LLC_LOOKUP.ANY_F
-//   0x0000 0001 0040 **34 UNC_CHA_LLC_LOOKUP.DATA_READ_F
-//   0x0000 0002 0040 **34 UNC_CHA_LLC_LOOKUP.OTHER_REQ_F       Writebacks to the LLC
-//   0x0000 0004 0040 **34 UNC_CHA_LLC_LOOKUP.FLUSH_OR_INV_F
-//   0x0000 0010 0040 **34 UNC_CHA_LLC_LOOKUP.CODE_READ_F
-//   0x0000 0040 0040 **34 UNC_CHA_LLC_LOOKUP.COREPREF_OR_DMND_LOCAL_F
-//   0x0000 0080 0040 **34 UNC_CHA_LLC_LOOKUP.LLCPREF_LOCAL_F
-//   0x0000 0200 0040 **34 UNC_CHA_LLC_LOOKUP.PREF_OR_DMND_REMOTE_F
-//   0x0000 1bc1 0040 0134 UNC_CHA_LLC_LOOKUP.DATA_READ_MISS
-//   0x0000 1e20 0040 ff34 UNC_CHA_LLC_LOOKUP.ALL_REMOTE
-//   0x0000 1bd0 0040 0134 UNC_CHA_LLC_LOOKUP.CODE_READ_MISS
-//   0x0000 1bc8 0040 0134 UNC_CHA_LLC_LOOKUP.RFO_MISS
-//   0x0000 1bc8 0040 0134 UNC_CHA_LLC_LOOKUP.RFO_MISS
-//   0x0000 1bd9 0040 0134 UNC_CHA_LLC_LOOKUP.READ_MISS
-//   0x0000 0bd9 0040 0134 UNC_CHA_LLC_LOOKUP.READ_MISS_LOC_HOM
-//   0x0000 13d9 0040 0134 UNC_CHA_LLC_LOOKUP.READ_MISS_REM_HOM
-//   0x0000 09d9 0040 ff34 UNC_CHA_LLC_LOOKUP.READ_LOCAL_LOC_HOM
-//   0x0000 0a19 0040 ff34 UNC_CHA_LLC_LOOKUP.READ_REMOTE_LOC_HOM
-//   0x0000 11d9 0040 ff34 UNC_CHA_LLC_LOOKUP.READ_LOCAL_REM_HOM
-//   0x0000 1bd9 0040 0e34 UNC_CHA_LLC_LOOKUP.READ_SF_HIT
-//   0x0000 1619 0040 0134 UNC_CHA_LLC_LOOKUP.READ_OR_SNOOP_REMOTE_MISS_REM_HOME
-//   0x0000 1a42 0040 ff34 UNC_CHA_LLC_LOOKUP.WRITES_AND_OTHER
-//   0x0000 0bdf 0040 ff34 UNC_CHA_LLC_LOOKUP.LOC_HOM
-//   0x0000 15df 0040 ff34 UNC_CHA_LLC_LOOKUP.REM_HOM
-//   0x0000 1a10 0040 ff34 UNC_CHA_LLC_LOOKUP.CODE_READ_REMOTE
-//   0x0000 19d0 0040 ff34 UNC_CHA_LLC_LOOKUP.CODE_READ_LOCAL
-//   0x0000 189d 0040 ff34 UNC_CHA_LLC_LOOKUP.LLCPREF_LOCAL
-//   0x0000 1bd0 0040 ff34 UNC_CHA_LLC_LOOKUP.CODE_READ
-// ==================================================================================================================
 
 	// I DON'T UNDERSTAND INTEL'S DOCUMENTATION FOR THE LLC_LOOKUP COUNTER 
 	// cha_perfevtsel[0] = 0x0040073d;		// SF_EVICTION S,E,M states
@@ -361,16 +201,6 @@ int main(int argc, char *argv[])
 	cha_perfevtsel[1] = 0x00400350;		// REQUESTS.READS
 	cha_perfevtsel[2] = 0x00400353;	    // DIR_LOOKUP.ANY
 	cha_perfevtsel[3] = 0x0040ff34;     // LLC_LOOKUP.ANY
-//	uint64_t cha_filter0 = 0x01e20000;		// set bits 24,23,22,21,17 FMESI -- all LLC lookups, no SF lookups -- DO NOT USE ON ICX
-
-// these events seem to work in the mesh traffic tracking code.....
-//    cha_perfevtsel[0] = 0x004003b8;     // HORZ_RING_BL_IN_USE.LEFT
-//    cha_perfevtsel[1] = 0x00400cb8;     // HORZ_RING_BL_IN_USE.RIGHT
-//    cha_perfevtsel[2] = 0x004003b2;     // VERT_RING_BL_IN_USE.UP
-//    cha_perfevtsel[3] = 0x00400cb2;     // VERT_RING_BL_IN_USE.DN
-
-
-//	printf("CHA FILTER0 0x%lx\n",cha_filter0);          # DO NOT USE ON ICX
 
 #ifdef VERBOSE
 	printf("VERBOSE: programming CHA counters\n");
@@ -410,7 +240,7 @@ int main(int argc, char *argv[])
  
     int msr_base;
     int msr_stride = 0x0e;
-	for (pkg=0; pkg<2; pkg++) {
+	for (pkg=0; pkg<NUM_SOCKETS; pkg++) {
 		for (tile=0; tile<NUM_CHA_USED; tile++) {
             if (tile >= 34) {
                 msr_base = 0x0e00 - 0x47c;       // ICX MSRs skip backwards for CHAs 34-39
@@ -455,7 +285,7 @@ int main(int argc, char *argv[])
 
     // Hit the global "unfreeze counter" function in the uncore global control on each chip
     // Enable the uncore fixed clock while I am at it....
-	for (pkg=0; pkg<2; pkg++) {
+	for (pkg=0; pkg<NUM_SOCKETS; pkg++) {
         msr_num = U_MSR_PMON_GLOBAL_CTL;
         msr_val = (1UL)<<61;
         pwrite(msr_fd[pkg],&msr_val,sizeof(msr_val),msr_num);
@@ -497,6 +327,9 @@ int main(int argc, char *argv[])
 	int NFLUSHES = 1000;
     int new_pages_mapped = 0;
     int primestride = 797;
+    long page_numbers_mapped[PAGES_MAPPED];
+    for (i=0; i<PAGES_MAPPED; i++) page_numbers_mapped[i] = 0;
+
 	// for (page_number=0; page_number<PAGES_MAPPED; page_number++) {
 	//for (page_number=0; page_number<NUMPAGES; page_number++) {
 	for (int iii=0; iii<NUMPAGES; iii++) {
@@ -712,6 +545,7 @@ int main(int argc, char *argv[])
 			} else {
 				printf("SUCCESS: wrote mapping file %d %s\n",new_pages_mapped,filename);
 			}
+        page_numbers_mapped[new_pages_mapped] = page_number;
         new_pages_mapped += 1;
         if (new_pages_mapped >= PAGES_MAPPED) break;
 		}
@@ -720,24 +554,14 @@ int main(int argc, char *argv[])
 	printf("DUMMY: globalsum %d\n",globalsum);
 	printf("VERBOSE: L3 Mapping Complete in %ld tries for %d cache lines ratio %f\n",totaltries,32768*PAGES_MAPPED,(double)totaltries/(double)(32768*PAGES_MAPPED));
 
-#ifndef MYHUGEPAGE_1GB
-	// now that the mapping is complete, I can add up the number of lines mapped to each CHA
-	// be careful to count only the lines that are used, not the full 24MiB
-	// 3 million elements is ~11.44 2MiB pages, so count all lines in each of the first 11 pages
-	// If I did the arithmetic correctly, the 3 million elements uses 931328 Bytes of the 12th 2MiB page
-	// which is 116416 elements or 14552 cache lines.
-
-	// first accumulate the first 11 full pages
-	for (page_number=0; page_number<11; page_number++) {
+    // Accumulate the number of lines mapped to each CHA slice in each of the new pages mapped
+	for (i=0; i<new_pages_mapped; i++) {
+        page_number = page_numbers_mapped[i];
 		for (line_number=0; line_number<32768; line_number++) {
 			lines_by_cha[cha_by_page[page_number][line_number]]++;
 		}
 	}
-	// then accumulate the partial 12th page
-	for (line_number=0; line_number<14552; line_number++) {
-		lines_by_cha[cha_by_page[11][line_number]]++;
-	}
-	// output
+    // Report the lines mapped to each CHA and the total number of lines mapped
 	long lines_accounted = 0;
 	printf("LINES_BY_CHA");
 	for (i=0; i<NUM_CHA_USED; i++) {
@@ -745,8 +569,7 @@ int main(int argc, char *argv[])
 		lines_accounted += lines_by_cha[i];
 	}
 	printf("\n");
-	printf("ACCCOUNTED FOR %ld lines expected %ld lines\n",lines_accounted,l2_contained_size/8);
-#endif // MYHUGEPAGE_1GB
+	printf("ACCCOUNTED FOR %ld lines\n",lines_accounted);
 // ============== END L3 MAPPING TESTS ==============================
 #endif // MAP_L3
 

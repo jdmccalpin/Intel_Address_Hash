@@ -1,8 +1,13 @@
 --------------------------------------------------------------------------------
-Revised to 2023-07-15
+Revised to 2023-07-28
 
+"make" should work with the Intel C compiler (icc).
+
+The Intel compiler shouild not be required, but it is convenient for the moment.
 
 --------------------------------------------------------------------------------
+Earlier (archaeological) notes
+
 Original build instructions as captured by the icc "-sox" flag:
 staff.frontera:~/Frontera/Util/ICX_mapper:2023-07-12T18:30:58 $ strings SnoopFilterMapper.exe | grep sox
 -?comment:Intel(R) C Intel(R) 64 Compiler for applications running on Intel(R) 64, Version 19.1.1.217 Build 20200306  : SnoopFilterMapper.c : -sox -g -O0 -DMAP_L3 -DMYHUGEPAGE_THP -DCHA_COUNTS -o SnoopFilterMapper.exe 
@@ -10,32 +15,11 @@ staff.frontera:~/Frontera/Util/ICX_mapper:2023-07-12T18:30:58 $ strings SnoopFil
 -?comment:Intel(R) C Intel(R) 64 Compiler for applications running on Intel(R) 64, Version 19.1.1.217 Build 20200306  : ssum.c : -sox -g -O0 -DMAP_L3 -DMYHUGEPAGE_THP -DCHA_COUNTS -o SnoopFilterMapper.exe 
 -sox -g -O0 -DMAP_L3 -DMYHUGEPAGE_THP -DCHA_COUNTS -o SnoopFilterMapper.exe
 --------------------------------------------------------------------------------
+The current development version ("Map_Addresses_to_L3_Slices_ICX.c") can be built in a single step, but now has its "helper"
+functions in separate source code files that are pulled into the main source with "#include" statements.
 
-
-The updated version ("Map_Addresses_to_L3_Slices_ICX.c") can be built in a single step.  
-
-With the Intel icc compiler, I used
+With the Intel icc compiler, I ran
 	icc -sox -g -O0 -DMAP_L3 -DMYHUGEPAGE_THP -DCHA_COUNTS  Map_Addresses_to_L3_Slices_ICX.c va2pa_lib.c -o Map_Addresses_to_L3_Slices_ICX.exe
 
 The resulting code ran correctly on a 40-core ICX (Xeon Platinum 8380).
-
-Recent Changes:
-	1. I reduced NUMPAGES from 40960 (80GiB) to 1024 (2GiB) for testing purposes.  For production you will 
-		probably need to increase it again so that different runs will get different physical page addresses.
-	2. I reduced PAGES_MAPPED from 256 to 16 for testing purposes.  For production you will probably want
-		to increase that to get more results per run and to have a higher probability of getting unique
-		2MiB physical pages.
-	3. Added two missing MSR_Arch*.h files to the directory.
-	4. Modified the compile command above to include va2pa_lib.c, since it was not actually #included
-		in this version of the code.
-	5. Remove all the code below the MAP_L3 section -- it is not used in the Address to L3-Slice mapping.
-		Not tested in execution, but compiles OK.
-	6. Verified that this version builds and runs in a clean clone of the github distribution.
-
-To Do:
-	a. There is tons of code from other tests in here -- not needed but does not seem to break anything.
-		Should be cleaned out at some point.
-	b. Eventually I need to merge the SKX, ICX, and SPR versions of this code into a single source file.
-		The CHA counter addressing is different and the SPR has different EventSelect values for the CHA 
-		events, but the changes can be isolated to few sections.
 --------------------------------------------------------------------------------
