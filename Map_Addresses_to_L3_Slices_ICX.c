@@ -37,63 +37,23 @@ static char const rcsid[] = "$Id: SnoopFilterMapper.c,v 1.3 2023/01/12 17:53:11 
 void print_pagemap_entry(unsigned long long pagemap_entry);
 unsigned long long get_pagemap_entry( void * va );
 
-int dumpall;			// when set to 1, will cause dump of lots of stuff for debugging
-int report;
-int nwraps;				// track number of performance counter wraps
-
 double *array;					// array pointer to mmap on 1GiB pages
 double *page_pointers[NUMPAGES];		// one pointer for each page allocated
 uint64_t pageframenumber[NUMPAGES];	// one PFN entry for each page allocated
 
 // constant value defines
 # define NUM_SOCKETS 2				// 
-# define NUM_IMC_CHANNELS 8			// includes channels on all IMCs in a socket
-# define NUM_IMC_COUNTERS 5			// 0-3 are the 4 programmable counters, 4 is the fixed-function DCLK counter
 # define NUM_CHA_BOXES 40
 # define NUM_CHA_USED 40
 # define NUM_CHA_COUNTERS 4
 
-long imc_counts[NUM_SOCKETS][NUM_IMC_CHANNELS][NUM_IMC_COUNTERS][2];	// including the fixed-function (DCLK) counter as the final entry
-long imc_pkg_sums[NUM_SOCKETS][NUM_IMC_COUNTERS];						// sum across channels for each chip
-char imc_event_name[NUM_SOCKETS][NUM_IMC_CHANNELS][NUM_IMC_COUNTERS][32];		// reserve 32 characters for the IMC event names for each socket, channel, counter
-uint32_t imc_perfevtsel[NUM_IMC_COUNTERS];			// expected control settings for the counters
-uint32_t imc_vid_did[3];							// PCIe configuration space vendor and device IDs for the IMC blocks 
 long cha_counts[NUM_SOCKETS][NUM_CHA_BOXES][NUM_CHA_COUNTERS][2];		// 2 sockets, 28 tiles per socket, 4 counters per tile, 2 times (before and after)
 uint64_t cha_perfevtsel[NUM_CHA_COUNTERS];
 long cha_pkg_sums[NUM_SOCKETS][NUM_CHA_COUNTERS];
 
-#define MAXCORES 112
-#define CORES_USED 28
-// New feature -- core counters.
-// upgrade to include counters for all cores 
-long core_counters[MAXCORES][4][2];					// 24 cores & 24 threads on one socket, 4 counters, before and after
-long fixed_counters[MAXCORES][4][2];				// 24 cores with 4 fixed-function core counters (Instr, CoreCyc, RefCyc, TSC)
-long core_pkg_sums[NUM_SOCKETS][4];					// four core counters
-long fixed_pkg_sums[NUM_SOCKETS][4];				// four fixed-function counters per core (Instr, CoreCyc, RefCyc, TSC)
-
 int8_t cha_by_page[NUMPAGES][32768];				// L3 numbers for each of the 32,768 cache lines in each of the first PAGES_MAPPED 2MiB pages
 uint64_t paddr_by_page[NUMPAGES];					// physical addresses of the base of each of the first PAGES_MAPPED 2MiB pages used
 long lines_by_cha[NUM_CHA_USED];			// bulk count of lines assigned to each CHA
-
-#ifdef DEBUG
-FILE *log_file;					// log file for debugging -- should not be needed in production
-#endif // DEBUG
-unsigned int *mmconfig_ptr;         // must be pointer to 32-bit int so compiler will generate 32-bit loads and stores
-
-struct timeval tp;		// seconds and microseconds from gettimeofday
-struct timezone tzp;	// required, but not used here.
-
-double ssum(double *a, long vl);
-
-double mysecond()
-{
-        struct timeval tp;
-        struct timezone tzp;
-        int i;
-
-        i = gettimeofday(&tp,&tzp);
-        return ( (double) tp.tv_sec + (double) tp.tv_usec * 1.e-6 );
-}
 
 # ifndef MIN
 # define MIN(x,y) ((x)<(y)?(x):(y))
@@ -102,52 +62,10 @@ double mysecond()
 # define MAX(x,y) ((x)>(y)?(x):(y))
 # endif
 
-
-#include "low_overhead_timers.c"
-
-#ifdef IMC_COUNTS
-#include "SKX_IMC_BusDeviceFunctionOffset.h"
-#endif // IMC_COUNTS
-
-#include "MSR_defs.h"
-
-// ===========================================================================================================================================================================
-// Convert PCI(bus:device.function,offset) to uint32_t array index
-uint32_t PCI_cfg_index(unsigned int Bus, unsigned int Device, unsigned int Function, unsigned int Offset)
-{
-    uint32_t byteaddress;
-    uint32_t index;
-    assert (Device >= 0);
-    assert (Function >= 0);
-    assert (Offset >= 0);
-    assert (Device < (1<<5));
-    assert (Function < (1<<3));
-    assert (Offset < (1<<12));
-    byteaddress = (Bus<<20) | (Device<<15) | (Function<<12) | Offset;
-    index = byteaddress / 4;
-    return ( index );
-}
-
-// Compute the difference of 48-bit counter values, correcting
-// for a single overflow of the counter if necessary
-long corrected_delta48(int tag, long end, long start)
-{
-    long result;
-	int i;
-    if (end >= start) {
-        result = (long) (end - start);
-    } else {
-        // result = (long) ((end + (1UL<<48)) - start);
-        result = 0;
-		if (report == 1) {
-			nwraps++;
-			dumpall = 1;
-			i = gettimeofday(&tp,&tzp);
-			printf("DEBUG: wrap detected at %ld.%.6ld tag %d end %ld (0x%lx) start %ld (0x%lx) result %ld (0x%lx)\n",tp.tv_sec,tp.tv_usec,tag,end,end,start,start,result,result);
-		}
-    }
-    return (result);
-}
+#include "MSR_defs.h"                   // includes MSR_Architectural.h and MSR_ArchPerfMon_v3.h -- very few of these defines are used here 
+#include "low_overhead_timers.c"        // probably need to link this to my official github version
+#include "cpuid_check_inline.c"         // CPUID "signatures" (CPUID/leaf 0x01, return value in eax with stepping masked out)
+#include "PCI_cfg_index.c"              // convert bus/device/function/offset to index on uint32_t mmapped array
 
 // ===========================================================================================================================================================================
 int main(int argc, char *argv[])
@@ -155,12 +73,9 @@ int main(int argc, char *argv[])
 	// local declarations
 	// int cpuid_return[4];
 	int i;
-	int retries;
-	int zeros;
 	int tag;
 	int rc;
 	ssize_t rc64;
-	char description[100];
 	size_t len;
 	long arraylen;
 	long l2_contained_size, inner_repetitions;
@@ -168,10 +83,9 @@ int main(int argc, char *argv[])
 	unsigned long paddr, basephysaddr;
 	unsigned long pagenum, basepagenum;
 	uint32_t bus, device, function, offset, ctl_offset, ctr_offset, value, index;
-	uint32_t socket, imc, channel, counter, controller;
+	uint32_t socket, counter;
 	long count,delta;
 	long j,k,page_number,page_base_index,line_number;
-	long jstart[CORES_USED], jend[CORES_USED], mycore, vl[CORES_USED];
 	uint32_t low_0, high_0, low_1, high_1;
 	char filename[100];
 	int pkg, tile;
@@ -189,54 +103,8 @@ int main(int argc, char *argv[])
 	double tsc_rate = 2.1e9;
 	double sf_evict_rate;
 	double bandwidth;
-    unsigned long mmconfig_base=0x80000000;		// DOUBLE-CHECK THIS ON NEW SYSTEMS!!!!!   grep MMCONFIG /proc/iomem | awk -F- '{print $1}'
-    unsigned long mmconfig_size=0x10000000;
-	double private_sum,partial_sums[CORES_USED];
-	long iters,iteration_counts[CORES_USED];
-	long BaseOffset;
 
-	BaseOffset = 0;
-#ifdef RANDOMOFFSETS
-	if (argc != 2) {
-		printf("Must Provide a Random Offset cache line offset value (an integer between 0 and 2^24-375000 (16,402,216))\n");
-		exit(1);
-	} else {
-		BaseOffset = atol(argv[1]);
-		printf("Random Cache Line Offset is %ld\n",BaseOffset);
-		BaseOffset = BaseOffset*8;
-		printf("Starting index for summation is %ld\n",BaseOffset);
-	}
-#endif // RANDOMOFFSETS
-
-	retries = 0;
-	zeros = 0;
-	report = 1;
-	dumpall = 0;
-	nwraps = 0;
-	l2_contained_size = 125000 * CORES_USED;		// about 95% of the L2 space in the cores used
-	for (i=0; i<CORES_USED; i++) {
-		iters = 0;
-		jstart[i] = BaseOffset + i*l2_contained_size/CORES_USED;
-		jend[i] = jstart[i] + l2_contained_size/CORES_USED;
-		vl[i] = jend[i]-jstart[i];
-		printf("thread %d jstart %ld jend %ld vl %ld\n",i,jstart[i],jend[i],vl[i]);
-
-		partial_sums[i] = 0.0;
-		iteration_counts[i] = 0;
-		for (counter=0; counter<4; counter++) {
-			core_counters[i][counter][0] = SPECIAL_VALUE;
-			core_counters[i][counter][1] = SPECIAL_VALUE;
-			fixed_counters[i][counter][0] = SPECIAL_VALUE;
-			fixed_counters[i][counter][1] = SPECIAL_VALUE;
-		}
-	}
-	// initialize the array that will hold the L3 numbers for each cache line for each of the first NUMPAGES 2MiB pages
-	for (i=0; i<NUMPAGES; i++) {
-		for (line_number=0; line_number<32768; line_number++) {
-			cha_by_page[i][line_number] = -1; 	// special value -- if set properly, all values should be in the range of 0..23
-		}
-	}
-
+    // ===============================================================================================================================
 	// allocate working array on a huge pages -- either 1GiB or 2MiB
 	len = NUMPAGES * MYPAGESIZE;
 #if defined MYHUGEPAGE_1GB
@@ -275,150 +143,63 @@ int main(int argc, char *argv[])
 		printf(" %.5ld   %.10ld  %#18lx  %#18lx  %#18lx  %#18lx\n",j,k,&array[k],pagemapentry,pageframenumber[j],(pageframenumber[j]<<12));
 #endif // VERBOSE
 	}
-	printf("PAGE_ADDRESSES ");
+	printf("PAGE_ADDRESSES\n");
 	for (j=0; j<NUMPAGES; j++) {
 		basephysaddr = pageframenumber[j] << 12;
 		paddr_by_page[j] = basephysaddr;
 		printf("0x%.12lx ",paddr_by_page[j]);
-        if (j%12 == 0) printf("\n");
+        if ((j+1)%8 == 0) printf("\n");
 	}
 	printf("\n");
+	for (j=0; j<NUMPAGES; j++) {
+		if ( (paddr_by_page[j] & 0x1fffffUL) != 0 ) {
+            printf("WARNING: page %d basephysaddr %p is not 2MiB-aligned\n",j,paddr_by_page[j]);
+        }
+    }
 
-
-	// initialize arrays for counter data
+    // ===============================================================================================================================
+	// initialize arrays for CHA counter data (only partially used in this MAP_L3 version, but not big enough to be a problem)
 	for (socket=0; socket<NUM_SOCKETS; socket++) {
-		for (channel=0; channel<NUM_IMC_CHANNELS; channel++) {
-			for (counter=0; counter<NUM_IMC_COUNTERS; counter++) {
-				imc_counts[socket][channel][counter][0] = 0;
-				imc_counts[socket][channel][counter][1] = 0;
-			}
-		}
 		for (tile=0; tile<NUM_CHA_USED; tile++) {
 			lines_by_cha[tile] = 0;
-			for (counter=0; counter<4; counter++) {
+			for (counter=0; counter<NUM_CHA_COUNTERS; counter++) {
 				cha_counts[socket][tile][counter][0] = 0;
 				cha_counts[socket][tile][counter][1] = 0;
 			}
 		}
 	}
-
-	// get the host name, assume that it is of the TACC standard form, and use this as part
-	// of the log file name....  Standard form is "c263-109.stampede2.tacc.utexas.edu", so
-	// truncating at the first "." is done by writing \0 to character #8.
-	len = 100;	
-	rc = gethostname(description, len);
-	if (rc != 0) {
-		fprintf(stderr,"ERROR when trying to get hostname\n");
-		exit(-1);
-	}
-	description[8] = 0;		// assume hostname of the form c263-109.stampede2.tacc.utexas.edu -- truncate after first period
-
-	my_uid = getuid();
-	my_gid = getgid();
-
-#ifdef DEBUG
-	sprintf(filename,"log.%s.perf_counters",description);
-	// sprintf(filename,"log.perf_counters");
-	log_file = fopen(filename,"w+");
-	if (log_file == 0) {
-		fprintf(stderr,"ERROR %s when trying to open log file %s\n",strerror(errno),filename);
-		exit(-1);
+	// initialize the array that will hold the L3 slice numbers for each cache line for each of the first NUMPAGES 2MiB pages
+	for (i=0; i<NUMPAGES; i++) {
+		for (line_number=0; line_number<32768; line_number++) {
+			cha_by_page[i][line_number] = -1; 	// special value -- if set properly, all values should be in the range of 0..23
+		}
 	}
 
-	fprintf(log_file,"DEBUG: my uid is %d, my gid is %d\n",my_uid,my_gid);
-
-	rc = chown(filename,my_uid,my_gid);
-	if (rc == 0) {
-		fprintf(log_file,"DEBUG: Successfully changed ownership of log file to %d %d\n",my_uid,my_gid);
-	} else {
-		fprintf(stderr,"ERROR: Attempt to change ownership of log file failed -- bailing out\n");
-		exit(-1);
-	}
-#endif // DEBUG
 
 	//========================================================================================================================
-	// initial checks
-	// 		is this a supported core?  (CPUID Family/Model)
-	//      Every processor that I am going to see will be Family 0x06 (no ExtFamily needed).
-	//      The DisplayModel field is (ExtModel<<4)+Model and should be 0x3F for all Xeon E5 v3 systems
-	int leaf = 1;
-	int subleaf = 0;
-	uint32_t eax, ebx, ecx, edx;
-	__asm__ __volatile__ ("cpuid" : \
-		  "=a" (eax), "=b" (ebx), "=c" (ecx), "=d" (edx) : "a" (leaf), "c" (subleaf));
+	// Identify the processor by CPUID signature (CPUID leaf 0x01, return value in %eax)
+	// If not supported, Don't abort yet but save the CurrentCPUIDSignature for later processor-dependent conditionals
 
-	// Alternate form: 
-	// 		The compiler cpuid intrinsics are not documented by Intel -- they use the Microsoft format
-	// 			described at https://msdn.microsoft.com/en-us/library/hskdteyh.aspx
-	// 			__cpuid(array to hold eax,ebx,ecx,edx outputs, initial eax value)
-	// 			__cpuidex(array to hold eax,ebx,ecx,edx outputs, initial eax value, initial ecx value)
-	//      CPUID function 0x01 returns the model info in eax.
-	//      		27:20 ExtFamily	-- expect 0x00
-	//      		19:16 ExtModel	-- expect 0x3 for HSW, 0x5 for SKX
-	//      		11:8  Family	-- expect 0x6
-	//      		7:4   Model		-- expect 0xf for HSW, 0x5 for SKX
-	// __cpuid(&cpuid_return[0], 1);
-	// uint32_t ModelInfo = cpuid_return[0] & 0x0fff0ff0;	// mask out the reserved and "stepping" fields, leaving only the based and extended Family/Model fields
+    uint32_t CurrentCPUIDSignature;     // CPUID Signature for the current system -- save for later processor-dependent conditionals
+    CurrentCPUIDSignature = cpuid_signature();
 
-	uint32_t ModelInfo = eax & 0x0fff0ff0;	// mask out the reserved and "stepping" fields, leaving only the based and extended Family/Model fields
-    //uint32_t ExpectedModel = 0x00050650;    // SKX/CLX
-    uint32_t ExpectedModel = 0x000606a0;     // ICX
-	if (ModelInfo != ExpectedModel) {
-		fprintf(stderr,"ERROR -- this does not appear to be the correct processor type!!!\n");
-		fprintf(stderr,"ERROR -- Expected CPUID(0x01) Family/Model bits = 0x%x, but found 0x%x\n",ExpectedModel,ModelInfo);
-		exit(1);
-	}
+    switch(CurrentCPUIDSignature) {
+        case CPUID_SIGNATURE_HASWELL:
+            printf("CPUID Signature 0x%x identified as Haswell EP\n",CurrentCPUIDSignature);
+            break;
+        case CPUID_SIGNATURE_SKX:
+            printf("CPUID Signature 0x%x identified as Skylake Xeon/Cascade Lake Xeon\n",CurrentCPUIDSignature);
+            break;
+        case CPUID_SIGNATURE_ICX:
+            printf("CPUID Signature 0x%x identified as Ice Lake Xeon\n",CurrentCPUIDSignature);
+            break;
+        case CPUID_SIGNATURE_SPR:
+            printf("CPUID Signature 0x%x identified as Sapphire Rapids Xeon\n",CurrentCPUIDSignature);
+            break;
+        default:
+            printf("CPUID Signature 0x%x not a supported value\n",CurrentCPUIDSignature);
+    }
 
-#ifdef IMC_COUNTS
-	// ===================================================================================================================
-	// ------------------ REQUIRES ROOT PERMISSIONS ------------------
-	// open /dev/mem for PCI device access and mmap() a pointer to the beginning
-	// of the 256 MiB PCI Configuration Space.
-	// 		check VID/DID for uncore bus:device:function combinations
-	//   Note that using /dev/mem for PCI configuration space access is required for some devices on KNL.
-	//   It is not required on other systems, but it is not particularly inconvenient either.
-	sprintf(filename,"/dev/mem");
-#ifdef DEBUG
-	fprintf(log_file,"opening %s\n",filename);
-#endif // DEBUG
-	mem_fd = open(filename, O_RDWR);
-	if (mem_fd == -1) {
-		fprintf(stderr,"ERROR %s when trying to open %s\n",strerror(errno),filename);
-		exit(-1);
-	}
-	int map_prot = PROT_READ | PROT_WRITE;
-	mmconfig_ptr = mmap(NULL, mmconfig_size, map_prot, MAP_SHARED, mem_fd, mmconfig_base);
-    if (mmconfig_ptr == MAP_FAILED) {
-        fprintf(stderr,"cannot mmap base of PCI configuration space from /dev/mem: address %lx\n", mmconfig_base);
-        exit(2);
-#ifdef DEBUG
-    } else {
-		fprintf(log_file,"Successful mmap of base of PCI configuration space from /dev/mem at address %lx\n", mmconfig_base);
-#endif // DEBUG
-	}
-    close(mem_fd);      // OK to close file after mmap() -- the mapping persists until unmap() or program exit
-
-	// New simple test that does not need to know the uncore bus numbers here...
-	// Skylake bus 0, Function 5, offset 0 -- Sky Lake-E MM/Vt-d Configuration Registers
-	//
-	// simple test -- should return "20248086" on Skylake Xeon EP -- DID 0x2024, VID 0x8086
-	bus = 0x00;
-	device = 0x5;
-	function = 0x0;
-	offset = 0x0;
-	index = PCI_cfg_index(bus, device, function, offset);
-    value = mmconfig_ptr[index];
-	if (value != 0x20248086) {
-		fprintf(stderr,"ERROR: Bus %x device %x function %x offset %x expected %x, found %x\n",bus,device,function,offset,0x20248086,value);
-		exit(3);
-#ifdef DEBUG
-	} else {
-		fprintf(log_file,"DEBUG: Well done! Bus %x device %x function %x offset %x returns expected value of %x\n",bus,device,function,offset,value);
-#endif // DEBUG
-	}
-#endif // IMC_COUNTS
-
-#ifdef CHA_COUNTS
 	// ===================================================================================================================
 	// open the MSR driver using one core in socket 0 and one core in socket 1
 	nr_cpus = sysconf(_SC_NPROCESSORS_ONLN);
@@ -439,16 +220,6 @@ int main(int argc, char *argv[])
 
     int core_under_test, socket_under_test;
     tsc_start = full_rdtscp(&socket_under_test, &core_under_test);
-
-	pread(msr_fd[socket_under_test],&msr_val,sizeof(msr_val),0x186);
-	printf("Core PerfEvtSel0 0x%lx\n",msr_val);
-	pread(msr_fd[socket_under_test],&msr_val,sizeof(msr_val),0x187);
-	printf("Core PerfEvtSel1 0x%lx\n",msr_val);
-	pread(msr_fd[socket_under_test],&msr_val,sizeof(msr_val),0x188);
-	printf("Core PerfEvtSel2 0x%lx\n",msr_val);
-	pread(msr_fd[socket_under_test],&msr_val,sizeof(msr_val),0x189);
-	printf("Core PerfEvtSel3 0x%lx\n",msr_val);
-
 
 	// Program the CHA mesh counters
 	//
@@ -605,13 +376,45 @@ int main(int argc, char *argv[])
 	printf("VERBOSE: programming CHA counters\n");
 #endif // VERBOSE
 
+    switch(CurrentCPUIDSignature) {
+        case CPUID_SIGNATURE_HASWELL:
+            printf("CPUID Signature 0x%x identified as Haswell EP\n",CurrentCPUIDSignature);
+            printf("--- not yet supported\n");
+            exit(1);
+        case CPUID_SIGNATURE_SKX:
+            printf("CPUID Signature 0x%x identified as Skylake Xeon/Cascade Lake Xeon\n",CurrentCPUIDSignature);
+            printf("--- not yet supported\n");
+            exit(1);
+        case CPUID_SIGNATURE_ICX:
+            printf("CPUID Signature 0x%x identified as Ice Lake Xeon\n",CurrentCPUIDSignature);
+            break;
+        case CPUID_SIGNATURE_SPR:
+            printf("CPUID Signature 0x%x identified as Sapphire Rapids Xeon\n",CurrentCPUIDSignature);
+            printf("--- not yet supported\n");
+            exit(1);
+            break;
+        default:
+            printf("CPUID Signature 0x%x not a supported value\n",CurrentCPUIDSignature);
+            exit(1);
+    }
+
+
+    // Which CHA events to monitor?
+    //      (a) inherit programming from parent process
+    //      (b) default set (TBD)
+    //      (c) read requested values from a text file?
+    //      (d) read requested values from environment variables?
+
+    // Program CHAs -- ICX-specific
+ 
+ 
     int msr_base;
     int msr_stride = 0x0e;
 	for (pkg=0; pkg<2; pkg++) {
 		for (tile=0; tile<NUM_CHA_USED; tile++) {
             if (tile >= 34) {
                 msr_base = 0x0e00 - 0x47c;       // ICX MSRs skip backwards for CHAs 34-39
-            } else if (tile >= 18) {              // ICX MSRs skil forward for CHAs 18-33
+            } else if (tile >= 18) {              // ICX MSRs skiward for CHAs 18-33
                 msr_base = 0x0e00 + 0x0e;
             } else {
                 msr_base = 0x0e00;
@@ -664,75 +467,6 @@ int main(int argc, char *argv[])
 #ifdef VERBOSE
 	printf("VERBOSE: Triggered UNFREEZE on all Uncore Counters, and enabled Uncore Clock Counter (MSR 0x704)\n");
 #endif // VERBOSE
-#endif // CHA_COUNTS
-
-#ifdef IMC_COUNTS
-	// ===================================================================================================================
-	// Read the current programming of the IMC counters and look for the standard values (in this order)
-	//     CAS_COUNT.READS		Event 0x04, Umask 0x03
-	//     CAS_COUNT.WRITES		Event 0x04, Umask 0x0C
-	//     ACT.ALL				Event 0x01, Umask 0x0B
-	//     PRE_COUNT.MISS		Event 0x02, Umask 0x01
-	//     DCLK
-
-#ifdef VERBOSE
-	printf("Preparing to program IMC counters\n");
-#endif // VERBOSE
-	// expected values of IMC performance counter event select control registers
-	imc_perfevtsel[0] = 0x00400304;		// CAS_COUNT.READS
-	imc_perfevtsel[1] = 0x00400C04;		// CAS_COUNT.WRITES
-	imc_perfevtsel[2] = 0x00400B01;		// ACT_COUNT.ALL
-	imc_perfevtsel[3] = 0x00400102;		// PRE_COUNT.MISS
-	imc_perfevtsel[4] = 0x00400000;		// DCLK
-
-	imc_vid_did[0] = 0x20428086;		// all channel 0 devices are 2042
-	imc_vid_did[1] = 0x20468086;		// all channel 1 devices are 2046
-	imc_vid_did[2] = 0x204a8086;		// all channel 2 devices are 204a
-
-	printf("IMC PerfEvtSel0 0x%lx\n",imc_perfevtsel[0]);
-	printf("IMC PerfEvtSel1 0x%lx\n",imc_perfevtsel[1]);
-	printf("IMC PerfEvtSel2 0x%lx\n",imc_perfevtsel[2]);
-	printf("IMC PerfEvtSel3 0x%lx\n",imc_perfevtsel[3]);
-	printf("IMC PerfEvtSel4 0x%lx\n",imc_perfevtsel[4]);
-
-	// print the full wall-clock time in seconds and microseconds
-	// assume both components of tp struct are longs.
-	fprintf(stdout,"# %s\n", rcsid);
-    i = gettimeofday(&tp,&tzp);
-	fprintf(stdout,"%ld %ld\n", tp.tv_sec,tp.tv_usec);
-
-	for (socket=0; socket<NUM_SOCKETS; socket++) {
-		bus = IMC_BUS_Socket[socket];
-#ifdef VERBOSE
-		printf("VERBOSE: socket %d bus %d\n",socket,bus);
-#endif // VERBOSE
-		for (channel=0; channel<NUM_IMC_CHANNELS; channel++) {
-			device = IMC_Device_Channel[channel];
-			function = IMC_Function_Channel[channel];
-#ifdef VERBOSE
-			printf("VERBOSE: channel %d device %d function %d\n",channel, device, function);
-#endif // VERBOSE
-			// check to make sure this is the correct device
-			offset = 0x0;
-			index = PCI_cfg_index(bus, device, function, offset);
-			value = mmconfig_ptr[index];
-			if ( value != imc_vid_did[channel%3]) {
-				fprintf(stderr,"WARNING!!!! socket %d, channel %d has vid_did %x but should be %x\n",socket,channel,value,imc_vid_did[channel%3]);
-			}
-			for (counter=0; counter<NUM_IMC_COUNTERS; counter++) {
-				// check to see if this unit is programmed correctly and reprogram if needed
-				offset = IMC_PmonCtl_Offset[counter];
-				index = PCI_cfg_index(bus, device, function, offset);
-				value = mmconfig_ptr[index];
-				if ( value != imc_perfevtsel[counter]) {
-					fprintf(stderr,"WARNING!!!! socket %d, channel %d has perfevtsel %x but should be %x -- reprogramming\n",socket,channel,value,imc_perfevtsel[counter]);
-					mmconfig_ptr[index] = imc_perfevtsel[counter];
-				}
-
-			}
-		}
-	}
-#endif // IMC_COUNTS
 
 // ========= END OF PERFORMANCE COUNTER SETUP ========================================================================
 
@@ -885,9 +619,10 @@ int main(int argc, char *argv[])
 				min_count = 1<<30;
 				sum_count = 0;
 				for (tile=0; tile<NUM_CHA_USED; tile++) {
-					max_count = MAX(max_count, cha_counts[socket_under_test][tile][1][1]-cha_counts[socket_under_test][tile][1][0]);
-					min_count = MIN(min_count, cha_counts[socket_under_test][tile][1][1]-cha_counts[socket_under_test][tile][1][0]);
-					sum_count += cha_counts[socket_under_test][tile][1][1]-cha_counts[socket_under_test][tile][1][0];
+					delta = corrected_pmc_delta(cha_counts[socket_under_test][tile][1][1],cha_counts[socket_under_test][tile][1][0],48);
+					max_count = MAX(max_count, delta);
+					min_count = MIN(min_count, delta);
+					sum_count += delta;
 				}
 				avg_count = (double)(sum_count - max_count) / (double)(NUM_CHA_USED);
 				goodness1 = (double) max_count / (double) NFLUSHES;
@@ -913,7 +648,8 @@ int main(int argc, char *argv[])
 				old_cha = -1;
 				int min_counts = (NFLUSHES*19)/20;
 				for (tile=0; tile<NUM_CHA_USED; tile++) {
-					if (cha_counts[socket_under_test][tile][1][1]-cha_counts[socket_under_test][tile][1][0] >= min_counts) {
+					delta = corrected_pmc_delta(cha_counts[socket_under_test][tile][1][1],cha_counts[socket_under_test][tile][1][0],48);
+					if (delta >= min_counts) {
 						old_cha = cha_by_page[page_number][line_number];
 						cha_by_page[page_number][line_number] = tile;
 						found++;
@@ -930,7 +666,8 @@ int main(int argc, char *argv[])
 					printf("WARNING: no CHA entry has been found for line %ld!\n",line_number);
 					printf("DEBUG dump for no CHA found\n");
 					for (tile=0; tile<NUM_CHA_USED; tile++) {
-						printf("CHA %d LLC_LOOKUP.READ          delta %ld\n",tile,(cha_counts[socket_under_test][tile][1][1]-cha_counts[socket_under_test][tile][1][0]));
+                        delta = corrected_pmc_delta(cha_counts[socket_under_test][tile][1][1],cha_counts[socket_under_test][tile][1][0],48);
+						printf("CHA %d LLC_LOOKUP.READ          delta %ld\n",tile,delta);
 					}
 #endif // VERBOSE
 				} else if (found == 1) {
@@ -940,7 +677,8 @@ int main(int argc, char *argv[])
 #ifdef VERBOSE
 					printf("DEBUG dump for multiple CHAs found\n");
 					for (tile=0; tile<NUM_CHA_USED; tile++) {
-						printf("CHA %d LLC_LOOKUP.READ          delta %ld\n",tile,(cha_counts[socket_under_test][tile][1][1]-cha_counts[socket_under_test][tile][1][0]));
+                        delta = corrected_pmc_delta(cha_counts[socket_under_test][tile][1][1],cha_counts[socket_under_test][tile][1][0],48);
+						printf("CHA %d LLC_LOOKUP.READ          delta %ld\n",tile,delta);
 					}
 #endif // VERBOSE
 				}
@@ -1011,7 +749,6 @@ int main(int argc, char *argv[])
 #endif // MYHUGEPAGE_1GB
 // ============== END L3 MAPPING TESTS ==============================
 #endif // MAP_L3
-
 
     exit(0);
 }
